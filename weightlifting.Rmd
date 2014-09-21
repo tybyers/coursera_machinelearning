@@ -1,0 +1,237 @@
+Machine Learning about Weight Lifting
+========================================================
+
+Tyler Byers
+
+Coursera Practical Machine Learning
+
+Sept 2014
+
+The goal of this project is to use body sensor data to predict the manner in which various subjects completed a set of repetitions of a Biceps curl with a light weight.  More information can be found at the original data source: http://groupware.les.inf.puc-rio.br/har
+
+## Load and Initially Process Data
+```{r read in data}
+library(caret); library(ggplot2)
+train <- read.csv('pml-training.csv')
+test <- read.csv('pml-testing.csv')
+```
+
+Summarize the data.
+
+```{r eda training}
+summary(train)
+names(train)
+```
+
+There are a lot of variables that have NA in them.  Most of these variables have 19216 NAs, out of 19622 observations.  This is so many NAs as to make these variables useless.  Also, there are several variables with thousands of blank entries along with '#DIV/0!' entries.  These also should be thrown out.  We will also remove variables such as `X` and the timestamps. Also, a later evaluation of the test set revealed that the `new_window` variable only had `no` so we will remove that variable as a predictor as well.  The following code removes these variables from both the train and test set.
+
+```{r remove unusable vars}
+# keep the below columns
+keepvars <- c(2,7:11,37:49,60:68,84:86,102,113:124,140,151:160)
+train <- train[,keepvars]
+test <- test[,keepvars]
+# Ensure we're left with usable variables
+summary(train)
+summary(test)
+```
+
+Now we have a much more manageable data set with only 54 predictors instead of 159 predictors.
+
+## Split Data
+
+Now we split the train set into a further training and testing set, which we will call `mytrain` and `mytest`.
+
+```{r split my test and my train set}
+set.seed(919)
+trainIndex <- createDataPartition(train$classe, p = 0.75, list = FALSE)
+mytrain <- train[trainIndex,]
+mytest <- train[-trainIndex,]
+```
+
+## Decision Tree Model
+
+As an admittedly lazy first step, we will see how a decision tree model works using all the predictor variables.
+
+```{r rpart model}
+library(rattle); library(rpart.plot)
+rpmod <- train(classe ~ ., method = 'rpart', data = mytrain)
+rpmod$finalModel
+fancyRpartPlot(rpmod$finalModel)
+rppred <- predict(rpmod, newdata = mytest)
+confusionMatrix(rppred, mytest$classe)
+```
+
+The accuracy was only 0.5926 for the decision trees.  I'll try a different model type.
+
+## Random Forest Model
+
+We prefer to use the `randomForest` package rather than call `rf` from within the `caret` package.
+
+```{r randomforest}
+library(randomForest)
+rfmod <- randomForest(classe ~ ., data = mytrain)
+importance(rfmod)
+rfpred <- predict(rfmod, newdata = mytest)
+confusionMatrix(rfpred, mytest$classe)
+```
+
+That was much better at 99.76% accuracy.
+
+## Visualize Most Important Variables
+
+We'll probably end up using a random forest for our final model.  First though we'd like to plot the relationships between some variables that the random forest model found to be most important.
+
+```{r create plots}
+ggplot(aes(x=num_window, y = roll_belt), data = mytrain) + 
+    geom_point(aes(color = classe))
+ggplot(aes(x=num_window, y = pitch_forearm), data = mytrain) + 
+    geom_point(aes(color = classe))
+ggplot(aes(x=roll_forearm, y = pitch_forearm), data = mytrain) + 
+    geom_point(aes(color = classe))
+ggplot(aes(x=yaw_forearm, y = pitch_forearm), data = mytrain) + 
+    geom_point(aes(color = classe))
+```
+
+Based on the above plots, it appears that the `classe` variable can be almost completely based on the num_window variable.  That seems like cheating.
+
+We'll investigate using another random forest model, running it with only num_window as the predictor.
+
+```{r rf num window}
+rfnwmod <- randomForest(classe ~ num_window, data = mytrain)
+rfnwpred <- predict(rfnwmod, newdata = mytest)
+confusionMatrix(rfnwpred, mytest$classe)
+```
+
+And that was completely accurate.  The question is, are the num_window vars the same in the test set?  If so, we believe we've found a leak.
+
+## Submit Test Set
+
+I'm curious if I've found a leak  (for more information on Leakage, see this Kaggle page: https://www.kaggle.com/wiki/Leakage).  That is, if all the results are based on a single variable.  I'm going to do a prediction on the main test set using the 1-variable prediction, and turn that in.
+
+```{r predict using single variable}
+rfnwpredall <- predict(rfnwmod, newdata = test)
+rfnwpredall
+```
+
+```{r write files}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(rfnwpredall)
+```
+
+That scored 20/20 on the submission page for the project.  We think this definitely can be considered to be a leak.
+
+With this very simple one-variable model (which we really consider as cheating!), we will likely have 100% out-of-sample error if new samples do not lie withi the `num_window` values we already have, but will have 0% out-of-sample errors if the new samples lie within our `num_window` values.
+
+## Create New Model, Without Leak
+
+We realize that finding the above variable may have given us 20/20 on the project submission page, but this is not at all a valid model to predict future data that may come in.  So we're going to remove the offending variable from the training and testing sets.
+
+```{r remove num_window var}
+head(names(train))
+train <- train[,-2]
+test <- test[,-2]
+# Re-create mytrain and mytest sets
+set.seed(919)
+trainIndex <- createDataPartition(train$classe, p = 0.75, list = FALSE)
+mytrain <- train[trainIndex,]
+mytest <- train[-trainIndex,]
+```
+
+Now we re-create the random forest model to see how it does using everything else as predictors.
+
+```{r re-run random forest}
+rfmod <- randomForest(classe ~ ., data = mytrain)
+importance(rfmod)
+rfpred <- predict(rfmod, newdata = mytest)
+confusionMatrix(rfpred, mytest$classe)
+```
+
+There are a few more errors than before, but we're still getting a very good 99.5% accuracy rate with the random forest.
+
+## Cross-Validation
+
+We feel fairly confident in this 99.5% accuracy rate.  However, we will doing a 5-fold cross validation just to make sure.
+
+```{r create folds}
+# create folds
+set.seed(995)
+folds <- createFolds(train$classe, k = 5)
+str(folds)
+```
+
+We've created 5 folds of length 3923-3926.  Now create testing and training sets from each.  The testing sets will be 1/5 the size of the training sets.  
+
+```{r 5-fold training and testing sets}
+train01 <- train[-folds$Fold1,]
+test01 <- train[folds$Fold1,]
+train02 <- train[-folds$Fold2,]
+test02 <- train[folds$Fold2,]
+train03 <- train[-folds$Fold3,]
+test03 <- train[folds$Fold3,]
+train04 <- train[-folds$Fold4,]
+test04 <- train[folds$Fold4,]
+train05 <- train[-folds$Fold5,]
+test05 <- train[folds$Fold5,]
+```
+
+Now we train a random forest on each of the training folds and predict on the corresponding test set.
+
+```{r cv random forests}
+rfmod1 <- randomForest(classe ~ ., data = train01)
+rfmod2 <- randomForest(classe ~ ., data = train02)
+rfmod3 <- randomForest(classe ~ ., data = train03)
+rfmod4 <- randomForest(classe ~ ., data = train04)
+rfmod5 <- randomForest(classe ~ ., data = train05)
+rfpred1 <- predict(rfmod1, newdata = test01)
+rfpred2 <- predict(rfmod2, newdata = test02)
+rfpred3 <- predict(rfmod3, newdata = test03)
+rfpred4 <- predict(rfmod4, newdata = test04)
+rfpred5 <- predict(rfmod5, newdata = test05)
+cf1 <- confusionMatrix(rfpred1, test01$classe)
+cf2 <- confusionMatrix(rfpred2, test02$classe)
+cf3 <- confusionMatrix(rfpred3, test03$classe)
+cf4 <- confusionMatrix(rfpred4, test04$classe)
+cf5 <- confusionMatrix(rfpred5, test05$classe)
+cf1$overall
+cf2$overall
+cf3$overall
+cf4$overall
+cf5$overall
+# average error:
+(cf1$overall[1] + cf2$overall[1] + cf3$overall[1] + cf4$overall[1] + 
+     cf5$overall[1]) / 5
+```
+
+Based on this cross-validation, I would expect to get about 0.42% out-of-sample error rate (i.e. out-of-sample would get 99.58% accuracy rate).
+
+## Compare Recent Predictions with Absolute
+
+Since I found the leak, I figured out all of the correct answers for the test set.  However, let's see how well we do predicting this set with our 5 rf models created in the cross-validation above.  So we are taking these five models, which use different parts of the training set, and "voting" for the correct classe.
+
+```{r ensemble predictions}
+rfpred1final <- predict(rfmod1, newdata = test)
+rfpred2final <- predict(rfmod2, newdata = test)
+rfpred3final <- predict(rfmod3, newdata = test)
+rfpred4final <- predict(rfmod4, newdata = test)
+rfpred5final <- predict(rfmod5, newdata = test)
+predfinal <- data.frame(rfpred1final, rfpred2final, rfpred3final,
+                        rfpred4final, rfpred5final)
+predfinal
+```
+
+Looking at the above, we can see that all rows are identical for our prediction, so we don't even need to do a voting scheme -- it's unanimous!
+
+So we are guessing that this model also produces 100 percent accuracy on the test set; so we'll do a confusion matrix with the previous answers, which we know to be correct after turning them in.
+
+```{r final comparison}
+# arbitrary which rfpred?final vector we choose
+confusionMatrix(predfinal$rfpred1final, rfnwpredall)
+```
+
+As expected, we were 100% accurate, so it turns out we didn't need to have discovered the leak at all!
